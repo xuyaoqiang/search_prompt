@@ -17,6 +17,7 @@ import jieba
 import hashlib
 import redis 
 from pypinyin import lazy_pinyin
+jieba.initialize()
 
 class SearchPrompt(object):
 
@@ -25,6 +26,7 @@ class SearchPrompt(object):
         self.redis = redis.Redis(redis_addr) 
         self.db = "db:%s" % scope
         self.index = "index:%s" % scope
+        self.hot = "hot:%s" % scope 
 
     def _get_index_key(self, key):
         return "%s:%s" % (self.index, key)
@@ -75,11 +77,11 @@ class SearchPrompt(object):
     def delete(self, item, pinyin=False, seg=False):
         self.item_check(item)
         uid = hashlib.md5(item['term'].encode('utf8')).hexdigest()
-        for prefix in self.prefixs_for_term(term['term'], seg=seg):
+        for prefix in self.prefixs_for_term(item['term'], seg=seg):
             self._delete_prefix(prefix, uid)
             if pinyin:
                 prefix_pinyin = ''.join(lazy_pinyin(prefix))
-                self._delete_prefix(prefix_pinyin)
+                self._delete_prefix(prefix_pinyin, uid)
 
 
     def update(self, item):
@@ -88,15 +90,16 @@ class SearchPrompt(object):
 
     def normalize(self, prefix):
         words = jieba.cut(prefix)
-        return [w for w in words ]
+        return [w for w in words if w.strip()]
 
-    def search(self, query, limit=5, fuzzy=False):
-
+    def _search(self, query, limit=5, fuzzy=False):
+        query = query.lower() 
         if not query: return []
         if fuzzy:
             search_querys = self.normalize(query) 
         else:
             search_querys = [query]
+        self.redis.zincrby(self.hot, query, 1)
         cache_key = self._get_index_key(('|').join(search_querys)) 
         if not self.redis.exists(cache_key):
             self.redis.zinterstore(cache_key, 
@@ -105,4 +108,39 @@ class SearchPrompt(object):
         if not ids: return ids
         return map(lambda x:json.loads(x), self.redis.hmget(self.db, *ids))
         
+    def search(self, query, limit=5, fuzzy=False):
+        ids = []
+        query = query.lower()
+        if not query: return ids 
+       
+        ids = self.redis.zrevrange(self._get_index_key(query), 0, limit-1)
+        self.redis.zincrby(self.hot, query, 1)
+
+        if fuzzy:
+            segments = self.normalize(query)
+            if len(ids) < limit and len(segments) > 1:
+                inter_cache_key = self._get_index_key(('&').join(segments)) 
+                if not self.redis.exists(inter_cache_key):
+                    self.redis.zinterstore(inter_cache_key, 
+                        map(lambda x:self._get_index_key(x), segments))
+                inter_ids = self.redis.zrevrange(inter_cache_key, 0, limit)
+                self.redis.delete(inter_cache_key)
+
+                union_cache_key = self._get_index_key(('|').join(segments))
+                if not self.redis.exists(union_cache_key):
+                    self.redis.zunionstore(union_cache_key, 
+                        map(lambda x:self._get_index_key(x), segments))
+                union_ids = self.redis.zrevrange(union_cache_key, 0, limit)
+                self.redis.delete(union_cache_key)
+
+                ids.extend(list(set(inter_ids) - set(ids)))
+                ids.extend(list(set(union_ids) - set(ids)))
+        if not ids: return ids 
+        ids = ids[:limit]
+        return map(lambda x:json.loads(x), self.redis.hmget(self.db, *ids))
+        
+
+    def hot_query(self, limit=5):
+        querys = self.redis.zrevrange(self.hot, 0, limit)
+        return querys 
 
